@@ -505,6 +505,12 @@ async def main():
     log.info("Starting bot and API server...")
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     await app.start()
+    # Fresh session (e.g. after a Render redeploy) has an empty peer cache, so resolve the channel up front
+    try:
+        chat = await app.get_chat(DEFAULT_CLOUD_CHANNEL_ID)
+        log.info("Cloud channel OK: %s", getattr(chat, "title", chat.id))
+    except Exception as e:
+        log.error("Cannot access cloud channel %s: %s  -> make the bot an ADMIN of that channel", DEFAULT_CLOUD_CHANNEL_ID, e)
 
     server = web.Application(middlewares=[error_middleware], client_max_size=(MAX_UPLOAD_MB + 10) * 1024 * 1024)
     server.on_response_prepare.append(add_cors)

@@ -11,6 +11,19 @@ from urllib.parse import quote
 # Event loop must exist before Pyrogram is imported
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
+import asyncio
+import logging
+import mimetypes
+import os
+import re
+import shutil
+import time
+import uuid
+from urllib.parse import quote
+
+# Event loop must exist before Pyrogram is imported
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 import aiohttp
 from aiohttp import web
@@ -215,6 +228,44 @@ async def error_middleware(request, handler):
 
 
 # ───────────────────────────── Telegram bot ─────────────────────────────
+async def ensure_cloud_channel():
+    """Fresh Render sessions forget the channel; restore it from Firebase if needed."""
+    try:
+        chat = await app.get_chat(DEFAULT_CLOUD_CHANNEL_ID)
+        log.info("Cloud channel OK: %s", getattr(chat, "title", chat.id))
+        return True
+    except Exception as e:
+        log.warning("Channel not resolved yet (%s), trying saved peer from Firebase", e)
+    try:
+        async with HTTP.get(fb("config/cloud_peer")) as r:
+            data = await r.json()
+        if data and data.get("access_hash"):
+            await app.storage.update_peers([(DEFAULT_CLOUD_CHANNEL_ID, int(data["access_hash"]), "channel", None, None)])
+            chat = await app.get_chat(DEFAULT_CLOUD_CHANNEL_ID)
+            log.info("Cloud channel restored from Firebase: %s", getattr(chat, "title", chat.id))
+            return True
+        log.error("No saved channel peer. Forward any post from the channel to the bot once (in private chat).")
+    except Exception as e:
+        log.error("Cannot access cloud channel %s: %s", DEFAULT_CLOUD_CHANNEL_ID, e)
+    return False
+
+
+@app.on_message(filters.private & filters.forwarded, group=-1)
+async def learn_cloud_channel(client, message):
+    chat = getattr(message, "forward_from_chat", None) or getattr(getattr(message, "forward_origin", None), "chat", None)
+    if chat is None or getattr(chat, "id", None) != DEFAULT_CLOUD_CHANNEL_ID:
+        return  # not our channel: let the normal handlers run
+    try:
+        peer = await client.storage.get_peer_by_id(chat.id)
+        async with HTTP.put(fb("config/cloud_peer"), json={"access_hash": str(peer.access_hash)}) as r:
+            ok = r.status < 300
+        await message.reply_text("✅ Cloud channel saved. Uploads should work now." if ok else "⚠️ Could not save to Firebase.")
+    except Exception as e:
+        log.exception("learn_cloud_channel failed")
+        await message.reply_text(f"Error: {e}")
+    message.stop_propagation()  # don't re-upload the forwarded post
+
+
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     await message.reply_text(
@@ -505,12 +556,7 @@ async def main():
     log.info("Starting bot and API server...")
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     await app.start()
-    # Fresh session (e.g. after a Render redeploy) has an empty peer cache, so resolve the channel up front
-    try:
-        chat = await app.get_chat(DEFAULT_CLOUD_CHANNEL_ID)
-        log.info("Cloud channel OK: %s", getattr(chat, "title", chat.id))
-    except Exception as e:
-        log.error("Cannot access cloud channel %s: %s  -> make the bot an ADMIN of that channel", DEFAULT_CLOUD_CHANNEL_ID, e)
+    await ensure_cloud_channel()
 
     server = web.Application(middlewares=[error_middleware], client_max_size=(MAX_UPLOAD_MB + 10) * 1024 * 1024)
     server.on_response_prepare.append(add_cors)
